@@ -1,0 +1,17 @@
+[package]
+name = "mongodb-lock"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mongodb = "3.1.0"
+bson = "2.13.0"
+thiserror = "1.0.63"
+displaydoc = "0.2.4"
+tokio = { version = "1.40.0", features = ["full"] }
+serde = { version = "1.0.210", features = ["derive"] }
+
+[dev-dependencies]
+uuid = { version = "1.10.0", features=["v4"]}
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
