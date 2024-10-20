@@ -153,6 +153,17 @@ impl<Key: Clone + Send + Sync + Serialize + 'static> Mutex<Key> {
         .await?;
         Ok(Self(col))
     }
+    /// Create [`Mutex`] without initializing the lock.
+    /// 
+    /// This should be used when the lock is already initialized; possibly by another process.
+    #[inline]
+    pub async fn new_uninit(
+        database: &mongodb::Database,
+        collection: &str,
+    ) -> Self {
+        let col = database.collection::<MutexDocument<Key>>(collection);
+        Self(col)
+    }
     /// Calls [`Mutex::lock`] with [`DEFAULT_TIMEOUT`] and [`DEFAULT_WAIT`].
     /// # Errors
     ///
@@ -347,6 +358,21 @@ impl RwLock {
             id,
             collection: col,
         })
+    }
+    /// Create [`RwLock`] without initializing the lock.
+    /// 
+    /// This should be used when the lock is already initialized; possibly by another process.
+    #[inline]
+    pub async fn new_uninit(
+        database: &mongodb::Database,
+        collection: &str,
+        id: ObjectId
+    ) -> Self {
+        let col = database.collection(collection);
+        Self {
+            id,
+            collection: col,
+        }
     }
     /// Calls [`RwLock::read`] with [`DEFAULT_TIMEOUT`] and [`DEFAULT_WAIT`].
     ///
