@@ -154,13 +154,10 @@ impl<Key: Clone + Send + Sync + Serialize + 'static> Mutex<Key> {
         Ok(Self(col))
     }
     /// Create [`Mutex`] without initializing the lock.
-    /// 
+    ///
     /// This should be used when the lock is already initialized; possibly by another process.
     #[inline]
-    pub async fn new_uninit(
-        database: &mongodb::Database,
-        collection: &str,
-    ) -> Self {
+    pub async fn new_uninit(database: &mongodb::Database, collection: &str) -> Self {
         let col = database.collection::<MutexDocument<Key>>(collection);
         Self(col)
     }
@@ -336,6 +333,12 @@ pub struct RwLock {
     collection: Collection<RwLockDocument>,
 }
 impl RwLock {
+    /// Returns the [`ObjectId`] of the underlying lock document stored in the collection.
+    ///
+    /// Intended for usage with [`RwLock::new_uninit`].
+    pub fn id(&self) -> ObjectId {
+        self.id
+    }
     /// Constructs a new [`RwLock`].
     ///
     /// # Errors
@@ -360,14 +363,10 @@ impl RwLock {
         })
     }
     /// Create [`RwLock`] without initializing the lock.
-    /// 
+    ///
     /// This should be used when the lock is already initialized; possibly by another process.
     #[inline]
-    pub async fn new_uninit(
-        database: &mongodb::Database,
-        collection: &str,
-        id: ObjectId
-    ) -> Self {
+    pub async fn new_uninit(database: &mongodb::Database, collection: &str, id: ObjectId) -> Self {
         let col = database.collection(collection);
         Self {
             id,
