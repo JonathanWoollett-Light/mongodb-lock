@@ -3,7 +3,7 @@
 //! All [`Mutex`]s can share the same collection (even with different `Key`s) so long as all the
 //! `Key`s in the collection are unique. I would recommend using different collections for different
 //! `Key`s and different collections for each type of operation.
-//! 
+//!
 //! All [`RwLock`]s can share the same collection. I would recommend using the same collection.
 //!     
 //! ## Similar works
@@ -377,7 +377,10 @@ impl RwLock {
             }
             let result = self
                 .collection
-                .find_one_and_update(doc! { "write": false }, doc! { "$inc": { "reads": 1i32 } })
+                .find_one_and_update(
+                    doc! { "_id": self.id, "write": false },
+                    doc! { "$inc": { "reads": 1i32 } },
+                )
                 .await
                 .map_err(RwLockReadError::Query)?;
             if let Some(RwLockDocument { _id, write, .. }) = result {
@@ -432,7 +435,7 @@ impl RwLock {
             let result = self
                 .collection
                 .find_one_and_update(
-                    doc! { "reads": 0i32, "write": false },
+                    doc! { "_id": self.id, "reads": 0i32, "write": false },
                     doc! { "$set": { "write": true } },
                 )
                 .await
