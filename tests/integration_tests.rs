@@ -1,8 +1,9 @@
 use bson::doc;
 use bson::oid::ObjectId;
 use mongodb::Client;
-use mongodb_lock::MutexDocument;
-use serde::Serialize;
+use mongodb_lock::Mutex;
+use mongodb_lock::RwLock;
+use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
@@ -23,7 +24,7 @@ impl AsRef<Client> for MongodbClient {
     }
 }
 
-struct Mongodb {
+pub struct Mongodb {
     name: String,
     port: u16,
 }
@@ -47,8 +48,8 @@ impl Mongodb {
                 &port.to_string(),
                 "--force",
             ])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .output()
             .unwrap();
         info!("setup deployment");
@@ -76,8 +77,8 @@ impl Drop for Mongodb {
         info!("deleting deployment");
         let _mongodb = Command::new("atlas")
             .args(["deployments", "delete", &self.name, "--force"])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .output()
             .unwrap();
         info!("deleted");
@@ -85,49 +86,133 @@ impl Drop for Mongodb {
 }
 
 #[tokio::test]
-async fn basic() {
+async fn single() {
+    use mongodb_lock::*;
+    #[derive(Clone, Serialize, Deserialize)]
+    struct MyDocument {
+        _id: ObjectId,
+        x: i32,
+    }
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt::Subscriber::builder()
+            .with_test_writer()
+            .finish(),
+    );
     let mongodb = Arc::new(Mongodb::new().await);
     let client = Mongodb::client(mongodb);
     let db = client.as_ref().database("basic");
-    let lock_col = db.collection::<_>("locks");
-    let key = [ObjectId::new(), ObjectId::new()];
-    let guard = mongodb_lock::Mutex::new_default(lock_col.clone(), key)
+    let docs = db.collection::<MyDocument>("docs");
+    let lock = Arc::new(Mutex::new(&db, "locks").await.unwrap());
+    let one = MyDocument {
+        _id: ObjectId::new(),
+        x: 1,
+    };
+    let two = MyDocument {
+        _id: ObjectId::new(),
+        x: 1,
+    };
+    let three = MyDocument {
+        _id: ObjectId::new(),
+        x: 1,
+    };
+    docs.insert_many(vec![one.clone(), two.clone(), three.clone()])
         .await
         .unwrap();
-    let lock_doc = MutexDocument {
-        _id: ObjectId::new(),
-        key,
-    };
-    let insert = lock_col.insert_one(lock_doc).await.unwrap_err();
-    assert!(mongodb_lock::is_duplicate_key_error(&insert));
-    drop(guard);
 
-    // It is important to give some leeway to allow the locks to get the handle
-    // to the runtime when releasing.
-    sleep(Duration::from_secs(5)).await;
+    let one_id = one._id;
+    let two_id = two._id;
+    let clock = lock.clone();
+    let cdocs = docs.clone();
+    let first = task::spawn(async move {
+        let _guard = clock.lock_default([one_id, two_id]).await.unwrap();
+        let a = cdocs
+            .find_one(doc! { "_id": one_id })
+            .await
+            .unwrap()
+            .unwrap();
+        let b = cdocs
+            .find_one(doc! { "_id": two_id })
+            .await
+            .unwrap()
+            .unwrap();
+        cdocs
+            .update_many(
+                doc! { "_id": { "$in": [one_id,two_id] }},
+                doc! { "$set": { "x": a.x + b.x } },
+            )
+            .await
+            .unwrap();
+    });
+    let two_id = two._id;
+    let three_id = three._id;
+    let clock = lock.clone();
+    let cdocs = docs.clone();
+    let second = task::spawn(async move {
+        let _guard = clock.lock_default([two_id, three_id]).await.unwrap();
+        let a = cdocs
+            .find_one(doc! { "_id": two_id })
+            .await
+            .unwrap()
+            .unwrap();
+        let b = cdocs
+            .find_one(doc! { "_id": three_id })
+            .await
+            .unwrap()
+            .unwrap();
+        cdocs
+            .update_many(
+                doc! { "_id": { "$in": [two_id,three_id] } },
+                doc! { "$set": { "x": a.x + b.x } },
+            )
+            .await
+            .unwrap();
+    });
+    first.await.unwrap();
+    second.await.unwrap();
+    let a = docs
+        .find_one(doc! { "_id": one_id })
+        .await
+        .unwrap()
+        .unwrap()
+        .x;
+    let b = docs
+        .find_one(doc! { "_id": two_id })
+        .await
+        .unwrap()
+        .unwrap()
+        .x;
+    let c = docs
+        .find_one(doc! { "_id": three_id })
+        .await
+        .unwrap()
+        .unwrap()
+        .x;
+    assert!((a == 2 && b == 3 && c == 3) || (a == 3 && b == 3 && c == 2));
 }
 
 #[tokio::test]
 async fn adder() {
-    use serde::{Deserialize, Serialize};
-
     #[derive(Debug, Serialize, Deserialize)]
     struct Number {
         _id: ObjectId,
         x: i32,
     }
-    const N: i32 = 5;
+    const N: i32 = 10;
     const A: i32 = 0;
     const B: i32 = 10;
 
     static CHECK_ONE: AtomicBool = AtomicBool::new(false);
     static CHECK_TWO: AtomicBool = AtomicBool::new(false);
 
-    tracing_subscriber::fmt::init();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt::Subscriber::builder()
+            .with_test_writer()
+            .finish(),
+    );
     let mongodb = Arc::new(Mongodb::new().await);
     let client = Mongodb::client(mongodb);
     let db = client.as_ref().database("adder");
-    let lock_col = db.collection::<_>("locks");
+    let lock = Arc::new(Mutex::new(&db, "locks").await.unwrap());
     let cola = db.collection::<Number>("first");
     let colb = db.collection::<Number>("second");
     let ida1 = ObjectId::new();
@@ -141,12 +226,10 @@ async fn adder() {
 
     let tasks = (0..N)
         .flat_map(|_| {
-            let (clock_col, ccola, ccolb, cida1, cidb1) =
-                (lock_col.clone(), cola.clone(), colb.clone(), ida1, idb1);
+            let (clock, ccola, ccolb, cida1, cidb1) =
+                (lock.clone(), cola.clone(), colb.clone(), ida1, idb1);
             let one = task::spawn(async move {
-                let guard = mongodb_lock::Mutex::new_default(clock_col, [cida1, cidb1])
-                    .await
-                    .unwrap();
+                let guard = clock.lock_default([cida1, cidb1]).await.unwrap();
                 assert!(!CHECK_ONE.swap(true, Ordering::SeqCst));
                 let num = ccola
                     .find_one(doc! { "_id": cida1 })
@@ -169,12 +252,10 @@ async fn adder() {
                 assert!(CHECK_ONE.swap(false, Ordering::SeqCst));
                 drop(guard);
             });
-            let (clock_col, ccola, ccolb, cida2, cidb2) =
-                (lock_col.clone(), cola.clone(), colb.clone(), ida2, idb2);
+            let (clock, ccola, ccolb, cida2, cidb2) =
+                (lock.clone(), cola.clone(), colb.clone(), ida2, idb2);
             let two = task::spawn(async move {
-                let guard = mongodb_lock::Mutex::new_default(clock_col, [cida2, cidb2])
-                    .await
-                    .unwrap();
+                let guard = clock.lock_default([cida2, cidb2]).await.unwrap();
                 assert!(!CHECK_TWO.swap(true, Ordering::SeqCst));
                 let num = ccola
                     .find_one(doc! { "_id": cida2 })
@@ -203,24 +284,93 @@ async fn adder() {
     for task in tasks {
         task.await.unwrap();
     }
-    
 
+    const T: i32 = N * 2;
     let numa1 = cola.find_one(doc! { "_id": ida1 }).await.unwrap().unwrap();
     let numb1 = colb.find_one(doc! { "_id": idb1 }).await.unwrap().unwrap();
     info!("numa1: {numa1:?}");
     info!("numb1: {numb1:?}");
     assert!(
-        (numa1.x == N + A + 1 && numb1.x == N + A) || (numb1.x == N + A + 1 && numa1.x == N + A)
+        (numa1.x == T - A + 1 && numb1.x == T + A) || (numb1.x == T + A - 1 && numa1.x == T + A)
     );
     let numa2 = cola.find_one(doc! { "_id": ida2 }).await.unwrap().unwrap();
     let numb2 = colb.find_one(doc! { "_id": idb2 }).await.unwrap().unwrap();
     info!("numa2: {numa2:?}");
     info!("numb2: {numb2:?}");
     assert!(
-        (numa2.x == N + B + 1 && numb2.x == N + B) || (numb2.x == N + B + 1 && numa2.x == N + B)
+        (numa2.x == T + B - 1 && numb2.x == T + B) || (numb2.x == T + B - 1 && numa2.x == T + B)
     );
+}
 
-    // It is important to give some leeway to allow the locks to get the handle
-    // to the runtime when releasing.
-    sleep(Duration::from_secs(5)).await;
+#[tokio::test]
+async fn reader() {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Number {
+        _id: ObjectId,
+        x: i32,
+    }
+    const READS: usize = 10;
+    const WRITE: usize = 10;
+
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt::Subscriber::builder()
+            .with_test_writer()
+            .finish(),
+    );
+    let mongodb = Arc::new(Mongodb::new().await);
+    let client = Mongodb::client(mongodb);
+    let db = client.as_ref().database("adder");
+    let lock = Arc::new(RwLock::new(&db, "locks").await.unwrap());
+    let col = db.collection::<Number>("first");
+    let id = ObjectId::new();
+    col.insert_one(Number { _id: id, x: 0 }).await.unwrap();
+
+    let reads = (0..READS)
+        .map(|_| {
+            let clock = lock.clone();
+            let ccol = col.clone();
+            let cid = id.clone();
+            task::spawn(async move {
+                let _guard = clock.read_default().await.unwrap();
+                let a = ccol.find_one(doc! { "_id": cid }).await.unwrap().unwrap().x;
+                assert_eq!(
+                    ccol.find_one(doc! { "_id": cid }).await.unwrap().unwrap().x,
+                    a
+                );
+                assert_eq!(
+                    ccol.find_one(doc! { "_id": cid }).await.unwrap().unwrap().x,
+                    a
+                );
+                assert_eq!(
+                    ccol.find_one(doc! { "_id": cid }).await.unwrap().unwrap().x,
+                    a
+                );
+            })
+        })
+        .collect::<Vec<_>>();
+    let writes = (0..WRITE)
+        .map(|_| {
+            let clock = lock.clone();
+            let ccol = col.clone();
+            let cid = id.clone();
+            task::spawn(async move {
+                let _guard = clock.write_default().await.unwrap();
+                let a = ccol.find_one(doc! { "_id": cid }).await.unwrap().unwrap().x;
+                ccol.update_one(doc! {"_id": cid}, doc! { "$inc": { "x": 1i32 } })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    ccol.find_one(doc! { "_id": cid }).await.unwrap().unwrap().x,
+                    a + 1
+                );
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for read in reads {
+        read.await.unwrap();
+    }
+    for write in writes {
+        write.await.unwrap();
+    }
 }

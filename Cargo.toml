@@ -2,6 +2,12 @@
 name = "mongodb-lock"
 version = "0.1.0"
 edition = "2021"
+description = "Rusty distributed locking backed by Mongodb."
+license = "Apache-2.0"
+
+repository = "https://github.com/JonathanWoollett-Light/mongodb-lock"
+documentation = "https://docs.rs/mongodb-lock/"
+readme = "./README.md"
 
 [dependencies]
 mongodb = "3.1.0"
@@ -10,8 +16,36 @@ thiserror = "1.0.63"
 displaydoc = "0.2.4"
 tokio = { version = "1.40.0", features = ["full"] }
 serde = { version = "1.0.210", features = ["derive"] }
+uuid = { version = "1.10.0", features=["v4"]}
 
 [dev-dependencies]
-uuid = { version = "1.10.0", features=["v4"]}
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
+futures = "0.3.31"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+restriction = { level = "warn", priority = -1 }
+
+enum_glob_use = "allow"
+match_wildcard_for_single_variants = "allow"
+module_name_repetitions = "allow"
+used_underscore_binding = "allow"
+wildcard_imports = "allow"
+blanket_clippy_restriction_lints = "allow"
+single_call_fn = "allow"
+implicit_return = "allow"
+question_mark_used = "allow"
+absolute_paths = "allow"
+exhaustive_enums = "allow"
+std_instead_of_core = "allow"
+pattern_type_mismatch = "allow"
+wildcard_enum_match_arm = "allow"
+std_instead_of_alloc = "allow"
+unseparated_literal_suffix = "allow"
+pub_underscore_fields = "allow"
+exhaustive_structs = "allow"
+missing_trait_methods = "allow"
+bool_assert_comparison = "allow"
+unneeded_field_pattern = "allow"
+single_char_lifetime_names = "allow"
