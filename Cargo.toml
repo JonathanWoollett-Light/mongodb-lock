@@ -1,6 +1,6 @@
 [package]
 name = "mongodb-lock"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Rusty distributed locking backed by Mongodb."
 license = "Apache-2.0"
