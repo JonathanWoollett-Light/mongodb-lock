@@ -5,53 +5,31 @@
 
 Rusty distributed locking backed by Mongodb.
 
+## Mutex
+
+This approach supports the simple case of enforcing mutual exclusion on a single docoument e.g.
 ```rust
-#[derive(Clone, Serialize, Deserialize)]
-struct MyDocument {
-    _id: ObjectId,
-    x: i32,
-}
-let db = client.database("basic");
-let docs = db.collection::<MyDocument>("docs");
-let lock = Arc::new(mongodb_lock::Mutex::new(&db, "locks").await.unwrap());
-let one = MyDocument { _id: ObjectId::new(), x: 1 };
-let two = MyDocument { _id: ObjectId::new(), x: 1 };
-let three = MyDocument { _id: ObjectId::new(), x: 1 };
-docs.insert_many(vec![one.clone(), two.clone(), three.clone()]).await.unwrap();
-
-let one_id = one._id;
-let two_id = two._id;
-let clock = lock.clone();
-let cdocs = docs.clone();
-let first = task::spawn(async move {
-    let _guard = clock.lock_default([one_id, two_id]).await.unwrap();
-    let a = cdocs.find_one(doc! { "_id": one_id }).await.unwrap().unwrap();
-    let b = cdocs.find_one(doc! { "_id": two_id }).await.unwrap().unwrap();
-    cdocs.update_many(
-        doc! { "_id": { "$in": [one_id,two_id] }},
-        doc! { "$set": { "x": a.x + b.x } }
-    ).await.unwrap();
-});
-
-let two_id = two._id;
-let three_id = three._id;
-let clock = lock.clone();
-let cdocs = docs.clone();
-let second = task::spawn(async move {
-    let _guard = lock.lock_default([two_id, three_id]).await.unwrap();
-    let a = cdocs.find_one(doc! { "_id": two_id }).await.unwrap().unwrap();
-    let b = cdocs.find_one(doc! { "_id": three_id }).await.unwrap().unwrap();
-    cdocs.update_many(
-        doc! { "_id": { "$in": [two_id,three_id] } },
-        doc! { "$set": { "x": a.x + b.x } }
-    ).await.unwrap();
-});
-
-first.await.unwrap();
-second.await.unwrap();
-
-let a = docs.find_one(doc! { "_id": one_id }).await.unwrap().unwrap().x;
-let b = docs.find_one(doc! { "_id": two_id }).await.unwrap().unwrap().x;
-let c = docs.find_one(doc! { "_id": three_id }).await.unwrap().unwrap().x;
-assert!((a == 2 && b == 3 && c == 3) || (a == 3 && b == 3 && c == 2));
+let lock = Mutex::new("my_database", "lock_collection", ["id"]);
+let guard = lock.lock_default(doc! { "id": my_document_id }).await?;
 ```
+While also supporting the more complex case where operations require mutual exclusion over
+multiple documents e.g.
+```rust
+use std::cmp;
+let lock = Mutex::new("my_database", "lock_collection", ["min","max"]);
+let get_doc = |x,y| doc! { "min": cmp::min(x,y), "max": cmp::max(x,y) };
+
+// Both of these guards can be held at the same time.
+let guard_one = lock.lock_default(get_doc(Some(id_one),None)).await?;
+let guard_two = lock.lock_default(get_doc(Some(id_two),None)).await?;
+
+// None of these guards can be held at the same time.
+// `guard_three` conflicts on `id_one`.
+// `guard_four` and `guard_six` conflict on `id_one` and `id_two`.
+let guard_three = lock.lock_default(get_doc(Some(id_one),None)).await?;
+let guard_four = lock.lock_default(get_doc(Some(id_two),Some(id_one))).await?;
+let guard_six = lock.lock_default(get_doc(Some(id_one), Some(id_two))).await?;
+```
+The use-case is where you have operations which require exclusive access to a single user (e.g.
+deleting a user) and operations which require exclusive access to multiple users (e.g. sending a
+message between users).

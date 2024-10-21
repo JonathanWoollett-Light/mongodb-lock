@@ -10,58 +10,41 @@
 //!
 //! - <https://github.com/square/mongo-lock>
 //!
-//! ## Example
+//! ## Mutex
 //!
+//! This approach supports the simple case of enforcing mutual exclusion on a single docoument e.g.
 //! ```ignore
-//! #[derive(Clone, Serialize, Deserialize)]
-//! struct MyDocument {
-//!     _id: ObjectId,
-//!     x: i32,
-//! }
-//! let db = client.database("basic");
-//! let docs = db.collection::<MyDocument>("docs");
-//! let lock = Arc::new(mongodb_lock::Mutex::new(&db, "locks").await.unwrap());
-//! let one = MyDocument { _id: ObjectId::new(), x: 1 };
-//! let two = MyDocument { _id: ObjectId::new(), x: 1 };
-//! let three = MyDocument { _id: ObjectId::new(), x: 1 };
-//! docs.insert_many(vec![one.clone(), two.clone(), three.clone()]).await.unwrap();
-//!
-//! let one_id = one._id;
-//! let two_id = two._id;
-//! let clock = lock.clone();
-//! let cdocs = docs.clone();
-//! let first = task::spawn(async move {
-//!     let _guard = clock.lock_default([one_id, two_id]).await.unwrap();
-//!     let a = cdocs.find_one(doc! { "_id": one_id }).await.unwrap().unwrap();
-//!     let b = cdocs.find_one(doc! { "_id": two_id }).await.unwrap().unwrap();
-//!     cdocs.update_many(
-//!         doc! { "_id": { "$in": [one_id,two_id] }},
-//!         doc! { "$set": { "x": a.x + b.x } }
-//!     ).await.unwrap();
-//! });
-//!
-//! let two_id = two._id;
-//! let three_id = three._id;
-//! let clock = lock.clone();
-//! let cdocs = docs.clone();
-//! let second = task::spawn(async move {
-//!     let _guard = lock.lock_default([two_id, three_id]).await.unwrap();
-//!     let a = cdocs.find_one(doc! { "_id": two_id }).await.unwrap().unwrap();
-//!     let b = cdocs.find_one(doc! { "_id": three_id }).await.unwrap().unwrap();
-//!     cdocs.update_many(
-//!         doc! { "_id": { "$in": [two_id,three_id] } },
-//!         doc! { "$set": { "x": a.x + b.x } }
-//!     ).await.unwrap();
-//! });
-//!
-//! first.await.unwrap();
-//! second.await.unwrap();
-//!
-//! let a = docs.find_one(doc! { "_id": one_id }).await.unwrap().unwrap().x;
-//! let b = docs.find_one(doc! { "_id": two_id }).await.unwrap().unwrap().x;
-//! let c = docs.find_one(doc! { "_id": three_id }).await.unwrap().unwrap().x;
-//! assert!((a == 2 && b == 3 && c == 3) || (a == 3 && b == 3 && c == 2));
+//! let lock = Mutex::new("my_database", "lock_collection", ["id"]);
+//! let guard = lock.lock_default(doc! { "id": my_document_id }).await?;
 //! ```
+//! While also supporting the more complex case where operations require mutual exclusion over
+//! multiple documents e.g.
+//! ```ignore
+//! use std::cmp;
+//! let lock = Mutex::new("my_database", "lock_collection", ["min","max"]);
+//! let get_doc = |x,y| {
+//!     match (x,y) {
+//!         (None, Some(b)) => doc! { "min": b, "max": b },
+//!         (Some(a), None) => doc! { "min": a, "max": a },
+//!         (Some(a), Some(b)) => doc! { "min": cmp::min(a,b), "max": cmp::max(a,b) }
+//!         (None, None) => doc! {}
+//!     }
+//! };
+//!
+//! // Both of these guards can be held at the same time.
+//! let guard_one = lock.lock_default(get_doc(Some(id_one),None)).await?;
+//! let guard_two = lock.lock_default(get_doc(Some(id_two),None)).await?;
+//!
+//! // None of these guards can be held at the same time.
+//! // `guard_three` conflicts on `id_one`.
+//! // `guard_four` and `guard_six` conflict on `id_one` and `id_two`.
+//! let guard_three = lock.lock_default(get_doc(Some(id_one),None)).await?;
+//! let guard_four = lock.lock_default(get_doc(Some(id_two),Some(id_one))).await?;
+//! let guard_six = lock.lock_default(get_doc(Some(id_one), Some(id_two))).await?;
+//! ```
+//! The use-case is where you have operations which require exclusive access to a single user (e.g.
+//! deleting a user) and operations which require exclusive access to multiple users (e.g. sending a
+//! message between users).
 
 use bson::doc;
 use bson::oid::ObjectId;
@@ -73,6 +56,7 @@ use mongodb::{
     Collection, IndexModel,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::iter::once;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -100,6 +84,8 @@ pub enum MutexLockError {
     CreateIndex(mongodb::error::Error),
     /// Failed to serialize to bson: {0}
     ToBson(bson::ser::Error),
+    /// A key ({0}) was present in the document given to [`Mutex::lock`] that was not present when the lock was initialized.
+    InvalidKey(String),
 }
 
 /// Error type for [`Mutex::release`].
@@ -113,26 +99,34 @@ enum ReleaseError {
 
 /// A distributed lock guard that acts like [`std::sync::MutexGuard`].
 #[derive(Debug)]
-pub struct MutexGuard<'a, Key: Clone + Send + Sync + Serialize + 'static> {
-    pub lock: &'a Mutex<Key>,
+pub struct MutexGuard<'a> {
+    pub lock: &'a Mutex,
     pub id: ObjectId,
     pub rt: Handle,
 }
 
 /// The document used for backing [`Mutex`].
 #[derive(Debug, Serialize, Deserialize)]
-struct MutexDocument<Key> {
+struct MutexDocument {
     /// Lock id
     pub _id: ObjectId,
     /// Key used for locking.
-    pub key: Key,
+    pub key: Document,
 }
 
 /// A distributed lock that acts like [`std::sync::Mutex`].
 #[derive(Debug)]
-pub struct Mutex<Key: Clone + Send + Sync + Serialize + 'static>(Collection<MutexDocument<Key>>);
+pub struct Mutex {
+    keys: HashSet<String>,
+    collection: Collection<MutexDocument>,
+}
 
-impl<Key: Clone + Send + Sync + Serialize + 'static> Mutex<Key> {
+impl Mutex {
+    /// Returns the keys that documents given to [`Mutex::lock`] or
+    /// [`Mutex::lock_default`] can contain.
+    pub fn keys(&self) -> &HashSet<String> {
+        &self.keys
+    }
     /// Constructs a new [`Mutex`].
     ///
     /// # Errors
@@ -142,34 +136,54 @@ impl<Key: Clone + Send + Sync + Serialize + 'static> Mutex<Key> {
     pub async fn new(
         database: &mongodb::Database,
         collection: &str,
+        keys: impl IntoIterator<Item = &str>,
     ) -> Result<Self, mongodb::error::Error> {
-        let col = database.collection::<MutexDocument<Key>>(collection);
-        col.create_index(
-            IndexModel::builder()
-                .keys(once((String::from("key"), Bson::Int32(1))).collect::<Document>())
-                .options(IndexOptions::builder().unique(true).build())
-                .build(),
-        )
-        .await?;
-        Ok(Self(col))
+        let col = database.collection::<MutexDocument>(collection);
+        let mut held_keys = HashSet::new();
+        for key in keys {
+            col.create_index(
+                IndexModel::builder()
+                    .keys(once((format!("key.{key}"), Bson::Int32(1))).collect::<Document>())
+                    .options(IndexOptions::builder().unique(true).build())
+                    .build(),
+            )
+            .await?;
+            held_keys.insert(String::from(key));
+        }
+
+        Ok(Self {
+            collection: col,
+            keys: held_keys,
+        })
     }
     /// Create [`Mutex`] without initializing the lock.
     ///
     /// This should be used when the lock is already initialized; possibly by another process.
     #[inline]
-    pub async fn new_uninit(database: &mongodb::Database, collection: &str) -> Self {
-        let col = database.collection::<MutexDocument<Key>>(collection);
-        Self(col)
+    pub async fn new_uninit(
+        database: &mongodb::Database,
+        collection: &str,
+        keys: impl IntoIterator<Item = &str>,
+    ) -> Self {
+        let col = database.collection::<MutexDocument>(collection);
+        let held_keys = keys.into_iter().map(String::from).collect();
+        Self {
+            collection: col,
+            keys: held_keys,
+        }
     }
     /// Calls [`Mutex::lock`] with [`DEFAULT_TIMEOUT`] and [`DEFAULT_WAIT`].
     /// # Errors
     ///
     /// When [`Mutex::lock`] errors.
     #[inline]
-    pub async fn lock_default(&self, key: Key) -> Result<MutexGuard<'_, Key>, MutexLockError> {
-        self.lock(DEFAULT_TIMEOUT, DEFAULT_WAIT, key).await
+    pub async fn lock_default(&self, document: Document) -> Result<MutexGuard<'_>, MutexLockError> {
+        self.lock(DEFAULT_TIMEOUT, DEFAULT_WAIT, document).await
     }
-    /// Attempts to lock the given `key` using the given lock `collection`.
+    /// Ensures mutaul exclusion across
+    ///
+    /// The guard cannot be acquired if any fields in a given [`bson::Document`] match any fields in
+    /// any [`bson::Document`]s of any held lock.
     ///
     /// Since the Mongodb Rust driver doesn't fully support change streams see
     /// <https://github.com/mongodb/mongo-rust-driver/issues/1230> a busy polling approach is used
@@ -204,25 +218,31 @@ impl<Key: Clone + Send + Sync + Serialize + 'static> Mutex<Key> {
     /// When:
     /// - Timing out.
     /// - [`mongodb::Collection::insert_one`] errors.
+    /// - There are keys present in `document` that where not given to [`Mutex::new`] or [`Mutex::new_uninit`].
     #[inline]
     pub async fn lock(
         &self,
         timeout: Duration,
         wait: Duration,
-        key: Key,
-    ) -> Result<MutexGuard<'_, Key>, MutexLockError> {
+        document: Document,
+    ) -> Result<MutexGuard<'_>, MutexLockError> {
+        for key in document.keys() {
+            if !self.keys.contains(key) {
+                return Err(MutexLockError::InvalidKey(key.clone()));
+            }
+        }
+
         let lock_id = ObjectId::new();
         let lock_doc = MutexDocument {
             _id: lock_id,
-            key: key.clone(),
+            key: document,
         };
-
         let start = Instant::now();
         loop {
             if start.elapsed() > timeout {
                 return Err(MutexLockError::LockTimeout);
             }
-            let insert = self.0.insert_one(&lock_doc).await;
+            let insert = self.collection.insert_one(&lock_doc).await;
             match insert {
                 Ok(InsertOneResult { inserted_id, .. }) => {
                     let id = inserted_id.as_object_id().ok_or(MutexLockError::ObjectId)?;
@@ -240,9 +260,11 @@ impl<Key: Clone + Send + Sync + Serialize + 'static> Mutex<Key> {
         }
     }
     /// Release the lock.
-    async fn release(&self, lock: ObjectId) -> Result<(), ReleaseError> {
-        let delete = self
-            .0
+    async fn release(
+        collection: Collection<MutexDocument>,
+        lock: ObjectId,
+    ) -> Result<(), ReleaseError> {
+        let delete = collection
             .delete_one(doc! { "_id": lock })
             .await
             .map_err(ReleaseError::PreDelete)?;
@@ -264,14 +286,15 @@ impl<Key: Clone + Send + Sync + Serialize + 'static> Mutex<Key> {
     clippy::unwrap_used,
     reason = "I do not know a way to propagate the error."
 )]
-impl<Key: Clone + Send + Sync + Serialize + 'static> Drop for MutexGuard<'_, Key> {
+impl Drop for MutexGuard<'_> {
     #[inline]
     fn drop(&mut self) {
         let rt = self.rt.clone();
         let id = self.id;
-        let lock = Mutex(self.lock.0.clone());
+        let collection = self.lock.collection.clone();
         task::spawn_blocking(move || {
-            rt.block_on(async { lock.release(id).await }).unwrap();
+            rt.block_on(async { Mutex::release(collection, id).await })
+                .unwrap();
         });
     }
 }
